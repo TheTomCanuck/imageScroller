@@ -1,6 +1,6 @@
 # Image Scroll Generator
 
-A little Bash script to generate a scrolling GIF or `.mov` from a static PNG.  
+A little Bash script to generate a scrolling GIF or `.mov` from a static PNG. tested most directions, we're fingers crossed on the others. open an issue if a direction doesnt work right
 Requires **ImageMagick** and **FFmpeg**. Works in **WSL**. Could probably be converted to PowerShell, but... ya know...
 
 ---
