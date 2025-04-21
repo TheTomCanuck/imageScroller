@@ -3,6 +3,8 @@
 A little Bash script to generate a scrolling GIF or `.mov` from a static PNG. tested most directions, we're fingers crossed on the others. open an issue if a direction doesnt work right
 Requires **ImageMagick** and **FFmpeg**. Works in **WSL**. Could probably be converted to PowerShell, but... ya know...
 
+videos are heavy cuz it uses ProRes 4444, i couldnt find any other way to avoid ghosting with transparency. 
+
 ---
 
 ## ⚡ Important Setup
