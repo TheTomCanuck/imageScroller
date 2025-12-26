@@ -19,6 +19,7 @@ VIDEO_CODEC=""                 # Video codec (auto-detected based on background,
 USE_GPU=""                     # GPU acceleration: auto, nvidia, amd, intel, off
 PARALLEL_JOBS=""               # Number of parallel jobs for frame generation (empty = auto)
 TEMP_DIR_BASE=""               # Base directory for temp files (empty = system default)
+PIXEL_STEP=1                   # Pixels to move per frame (auto-calculated for high speeds)
 
 # --- Usage Function ---
 usage() {
@@ -306,12 +307,35 @@ if [ -n "$SPEED_INPUT" ]; then
   if ! [[ "$SPEED_INPUT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( $(echo "$SPEED_INPUT <= 0" | bc -l 2>/dev/null) )); then
       echo "Error: Speed (-s) must be a positive number." >&2; usage
   fi
-  DELAY_FLOAT=$(echo "scale=10; 100 / $SPEED_INPUT" | bc)
-  DELAY=$(printf "%.0f" "$DELAY_FLOAT") # Round to nearest integer
-  if [ "$DELAY" -lt "$MIN_DELAY" ]; then
-    if [ "$VERBOSE" -eq 1 ]; then echo "Warning: Calculated delay (${DELAY}cs) from speed ${SPEED_INPUT} PPS below minimum (${MIN_DELAY}cs). Setting delay to ${MIN_DELAY}cs."; fi
-    DELAY=$MIN_DELAY
-  elif [ "$VERBOSE" -eq 1 ]; then echo "Using speed ${SPEED_INPUT} PPS, calculated delay: ${DELAY}cs"; fi
+
+  # Calculate optimal delay and pixel step
+  # Max framerate is 100fps (MIN_DELAY=1cs), so max speed at 1px/frame is 100 PPS
+  # For higher speeds, we increase pixel step and use max framerate
+  MAX_FPS=$(echo "scale=0; 100 / $MIN_DELAY" | bc)  # 100 fps at MIN_DELAY=1
+
+  if (( $(echo "$SPEED_INPUT > $MAX_FPS" | bc -l) )); then
+    # Need to skip pixels to achieve this speed
+    # PIXEL_STEP = ceil(SPEED / MAX_FPS)
+    PIXEL_STEP=$(echo "scale=0; ($SPEED_INPUT + $MAX_FPS - 1) / $MAX_FPS" | bc)
+    # Recalculate delay based on actual speed with this step
+    # delay = 100 * PIXEL_STEP / SPEED
+    DELAY_FLOAT=$(echo "scale=10; 100 * $PIXEL_STEP / $SPEED_INPUT" | bc)
+    DELAY=$(printf "%.0f" "$DELAY_FLOAT")
+    [ "$DELAY" -lt "$MIN_DELAY" ] && DELAY=$MIN_DELAY
+    ACTUAL_SPEED=$(echo "scale=2; 100 * $PIXEL_STEP / $DELAY" | bc)
+    if [ "$VERBOSE" -eq 1 ]; then
+      echo "Using speed ${SPEED_INPUT} PPS: ${PIXEL_STEP}px/frame at ${DELAY}cs delay (actual: ${ACTUAL_SPEED} PPS)"
+    fi
+  else
+    # Normal case: 1 pixel per frame
+    PIXEL_STEP=1
+    DELAY_FLOAT=$(echo "scale=10; 100 / $SPEED_INPUT" | bc)
+    DELAY=$(printf "%.0f" "$DELAY_FLOAT")
+    if [ "$DELAY" -lt "$MIN_DELAY" ]; then
+      DELAY=$MIN_DELAY
+    fi
+    if [ "$VERBOSE" -eq 1 ]; then echo "Using speed ${SPEED_INPUT} PPS, calculated delay: ${DELAY}cs"; fi
+  fi
   SPEED_PPS=$SPEED_INPUT
 # Process delay (-t) if provided
 elif [ -n "$DELAY_INPUT" ]; then
@@ -441,26 +465,27 @@ case "$DIRECTION" in
     if $IM_MONTAGE "$INPUT_IMAGE" "$INPUT_IMAGE" -tile 2x1 -geometry "+${GAP}+0" -alpha set -background none "$BASE_IMAGE"; then
         MONTAGE_SUCCESS=1
     fi
-    NUM_FRAMES=$STEP_W
+    NUM_FRAMES=$(( (STEP_W + PIXEL_STEP - 1) / PIXEL_STEP ))  # ceil(STEP_W / PIXEL_STEP)
     ;;
   vertical|vertical-rev)
     if $IM_MONTAGE "$INPUT_IMAGE" "$INPUT_IMAGE" -tile 1x2 -geometry "+0+${GAP}" -alpha set -background none "$BASE_IMAGE"; then
         MONTAGE_SUCCESS=1
     fi
-    NUM_FRAMES=$STEP_H
+    NUM_FRAMES=$(( (STEP_H + PIXEL_STEP - 1) / PIXEL_STEP ))  # ceil(STEP_H / PIXEL_STEP)
     ;;
   diagonal-*)
     if $IM_MONTAGE "$INPUT_IMAGE" "$INPUT_IMAGE" "$INPUT_IMAGE" "$INPUT_IMAGE" -tile 2x2 -geometry "+${GAP}+${GAP}" -alpha set -background none "$BASE_IMAGE"; then
         MONTAGE_SUCCESS=1
     fi
     # Use LCM to ensure seamless looping for diagonal scrolling
-    NUM_FRAMES=$(lcm "$STEP_W" "$STEP_H")
+    TOTAL_PIXELS=$(lcm "$STEP_W" "$STEP_H")
     # Cap at a reasonable maximum to prevent excessive frame counts
-    MAX_DIAGONAL_FRAMES=10000
-    if [ "$NUM_FRAMES" -gt "$MAX_DIAGONAL_FRAMES" ]; then
-        if [ "$VERBOSE" -eq 1 ]; then echo "Warning: LCM($STEP_W, $STEP_H) = $NUM_FRAMES exceeds maximum. Using max($STEP_W, $STEP_H) instead."; fi
-        NUM_FRAMES=$(( STEP_W > STEP_H ? STEP_W : STEP_H ))
+    MAX_DIAGONAL_PIXELS=10000
+    if [ "$TOTAL_PIXELS" -gt "$MAX_DIAGONAL_PIXELS" ]; then
+        if [ "$VERBOSE" -eq 1 ]; then echo "Warning: LCM($STEP_W, $STEP_H) = $TOTAL_PIXELS exceeds maximum. Using max($STEP_W, $STEP_H) instead."; fi
+        TOTAL_PIXELS=$(( STEP_W > STEP_H ? STEP_W : STEP_H ))
     fi
+    NUM_FRAMES=$(( (TOTAL_PIXELS + PIXEL_STEP - 1) / PIXEL_STEP ))
     ;;
   *)
     echo "Error: Internal logic error - invalid direction '$DIRECTION'." >&2
@@ -468,7 +493,13 @@ case "$DIRECTION" in
     ;;
 esac
 if [ "$MONTAGE_SUCCESS" -ne 1 ]; then echo "Error: Failed to create base tiled image." >&2; exit 1; fi
-if [ "$VERBOSE" -eq 1 ]; then echo "Base image created. Number of frames to generate: $NUM_FRAMES"; fi
+if [ "$VERBOSE" -eq 1 ]; then
+    if [ "$PIXEL_STEP" -gt 1 ]; then
+        echo "Base image created. Frames: $NUM_FRAMES (${PIXEL_STEP}px step)"
+    else
+        echo "Base image created. Number of frames to generate: $NUM_FRAMES"
+    fi
+fi
 
 # --- Generate Frames ---
 if [ "$PARALLEL_JOBS" -gt 1 ]; then
@@ -512,17 +543,21 @@ H=$6
 BASE_IMAGE=$7
 TMP_DIR=$8
 IM_CONVERT=$9
+PIXEL_STEP=${10}
+
+# Calculate pixel offset (frame index * step size)
+PIXEL_OFFSET=$((i * PIXEL_STEP))
 
 OFFSET_X=0; OFFSET_Y=0
 case "$DIRECTION" in
-    horizontal) OFFSET_X=$i ;;
-    horizontal-rev) OFFSET_X=$(( STEP_W - 1 - i )) ;;
-    vertical) OFFSET_Y=$i ;;
-    vertical-rev) OFFSET_Y=$(( STEP_H - 1 - i )) ;;
-    diagonal-dr) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
-    diagonal-dl) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
-    diagonal-ur) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
-    diagonal-ul) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
+    horizontal) OFFSET_X=$PIXEL_OFFSET ;;
+    horizontal-rev) OFFSET_X=$(( STEP_W - 1 - PIXEL_OFFSET )); [ "$OFFSET_X" -lt 0 ] && OFFSET_X=0 ;;
+    vertical) OFFSET_Y=$PIXEL_OFFSET ;;
+    vertical-rev) OFFSET_Y=$(( STEP_H - 1 - PIXEL_OFFSET )); [ "$OFFSET_Y" -lt 0 ] && OFFSET_Y=0 ;;
+    diagonal-dr) OFFSET_X=$(( PIXEL_OFFSET % STEP_W )); OFFSET_Y=$(( PIXEL_OFFSET % STEP_H )) ;;
+    diagonal-dl) OFFSET_X=$(( (STEP_W - (PIXEL_OFFSET % STEP_W)) % STEP_W )); OFFSET_Y=$(( PIXEL_OFFSET % STEP_H )) ;;
+    diagonal-ur) OFFSET_X=$(( PIXEL_OFFSET % STEP_W )); OFFSET_Y=$(( (STEP_H - (PIXEL_OFFSET % STEP_H)) % STEP_H )) ;;
+    diagonal-ul) OFFSET_X=$(( (STEP_W - (PIXEL_OFFSET % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (PIXEL_OFFSET % STEP_H)) % STEP_H )) ;;
 esac
 
 ERR=$($IM_CONVERT "$BASE_IMAGE" -alpha set -crop "${W}x${H}+${OFFSET_X}+${OFFSET_Y}" +repage "$TMP_DIR/frame_$(printf "%05d" $i).png" 2>&1)
@@ -540,7 +575,7 @@ WORKER_EOF
 
     # Generate all frame numbers and process in parallel
     seq 0 $((NUM_FRAMES - 1)) | nice -n 10 xargs -P "$PARALLEL_JOBS" -I {} \
-        "$WORKER_SCRIPT" {} "$DIRECTION" "$STEP_W" "$STEP_H" "$W" "$H" "$BASE_IMAGE" "$TMP_DIR" "$IM_CONVERT" 2>&1 | \
+        "$WORKER_SCRIPT" {} "$DIRECTION" "$STEP_W" "$STEP_H" "$W" "$H" "$BASE_IMAGE" "$TMP_DIR" "$IM_CONVERT" "$PIXEL_STEP" 2>&1 | \
     {
         FRAMES_DONE=0
         PROGRESS_INTERVAL=$(( NUM_FRAMES / 40 ))
@@ -589,16 +624,19 @@ else
     PROGRESS_INTERVAL=$(( NUM_FRAMES / 20 ))
     [ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
     for i in $(seq 0 $((NUM_FRAMES - 1))); do
+        # Calculate pixel offset (frame index * step size)
+        PIXEL_OFFSET=$((i * PIXEL_STEP))
+
         OFFSET_X=0; OFFSET_Y=0
         case "$DIRECTION" in
-            horizontal) OFFSET_X=$i ;;
-            horizontal-rev) OFFSET_X=$(( STEP_W - 1 - i )) ;;
-            vertical) OFFSET_Y=$i ;;
-            vertical-rev) OFFSET_Y=$(( STEP_H - 1 - i )) ;;
-            diagonal-dr) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
-            diagonal-dl) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
-            diagonal-ur) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
-            diagonal-ul) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
+            horizontal) OFFSET_X=$PIXEL_OFFSET ;;
+            horizontal-rev) OFFSET_X=$(( STEP_W - 1 - PIXEL_OFFSET )); [ "$OFFSET_X" -lt 0 ] && OFFSET_X=0 ;;
+            vertical) OFFSET_Y=$PIXEL_OFFSET ;;
+            vertical-rev) OFFSET_Y=$(( STEP_H - 1 - PIXEL_OFFSET )); [ "$OFFSET_Y" -lt 0 ] && OFFSET_Y=0 ;;
+            diagonal-dr) OFFSET_X=$(( PIXEL_OFFSET % STEP_W )); OFFSET_Y=$(( PIXEL_OFFSET % STEP_H )) ;;
+            diagonal-dl) OFFSET_X=$(( (STEP_W - (PIXEL_OFFSET % STEP_W)) % STEP_W )); OFFSET_Y=$(( PIXEL_OFFSET % STEP_H )) ;;
+            diagonal-ur) OFFSET_X=$(( PIXEL_OFFSET % STEP_W )); OFFSET_Y=$(( (STEP_H - (PIXEL_OFFSET % STEP_H)) % STEP_H )) ;;
+            diagonal-ul) OFFSET_X=$(( (STEP_W - (PIXEL_OFFSET % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (PIXEL_OFFSET % STEP_H)) % STEP_H )) ;;
             *) echo "Error: Internal logic error - invalid direction '$DIRECTION'." >&2; exit 1 ;;
         esac
         if ! $IM_CONVERT "$BASE_IMAGE" -alpha set -crop "${W}x${H}+${OFFSET_X}+${OFFSET_Y}" +repage "$TMP_DIR/frame_$(printf "%05d" $i).png"; then
