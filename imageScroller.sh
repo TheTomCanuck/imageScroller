@@ -760,7 +760,7 @@ if [[ "$OUTPUT_FORMAT" == "video" || "$OUTPUT_FORMAT" == "both" ]]; then
             ffmpeg -framerate "$FRAMERATE" \
                    -i "$TMP_DIR/frame_%05d.png" \
                    -c:v prores_ks \
-                   -pix_fmt yuva444p \
+                   -pix_fmt yuva444p10le \
                    -profile:v 4444 \
                    -alpha_bits "$PRORES_ALPHA_BITS" \
                    -threads "$VIDEO_THREADS" \
