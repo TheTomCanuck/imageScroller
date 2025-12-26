@@ -45,7 +45,7 @@ Example working settings:
 | `-d <dir>` | Scroll direction (direction the content appears to move). <br> Options: `left (l)` _(default)_, `right (r)`, `up (u)`, `down (d)`, `up-left (ul)`, `up-right (ur)`, `down-left (dl)`, `down-right (dr)`. |
 | `-g <pixels>` | Gap between image repetitions. _(Default: 10 pixels)_. Must be ≥ 0. |
 | `-t <delay>` | Delay between frames (1/100s, e.g., `4` = 25fps). Mutually exclusive with `-s`. |
-| `-s <speed>` | Speed in Pixels Per Second (e.g., `25`). Mutually exclusive with `-t`. |
+| `-s <speed>` | Speed in Pixels Per Second (e.g., `50`). Speeds over 100 PPS auto-scale using larger pixel steps. Mutually exclusive with `-t`. |
 | `-b <color>` | Background color (e.g., `white`, `black`, `#FF0000`). Flattens transparency and defaults to H.264. Omit for transparency (ProRes). |
 | `-c <codec>` | Video codec: `h264`, `h265`, `prores`. _(Default: `h264` if `-b` set, `prores` otherwise)_. |
 | `-G <gpu>` | GPU acceleration: `auto` (detect), `nvidia`, `amd`, `intel`, `off`. _(Default: auto)_. |
@@ -55,6 +55,7 @@ Example working settings:
 | `-y` | Force overwrite without prompting. |
 | `-v` | Verbose output. |
 | `-V` | Show version. |
+| `-h` | Show help message. |
 
 ---
 
@@ -84,4 +85,10 @@ Example working settings:
 
 # Sequential processing (slowest, minimal system impact)
 ./imageScroller.sh -i mybanner.png -j off
+
+# Fast scrolling (200 pixels/second, auto-uses 2px steps at 100fps)
+./imageScroller.sh -i mybanner.png -s 200
+
+# Slow, smooth scrolling (25 pixels/second)
+./imageScroller.sh -i mybanner.png -s 25
 ```
