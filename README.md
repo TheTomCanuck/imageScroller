@@ -49,6 +49,8 @@ Example working settings:
 | `-b <color>` | Background color (e.g., `white`, `black`, `#FF0000`). Flattens transparency and defaults to H.264. Omit for transparency (ProRes). |
 | `-c <codec>` | Video codec: `h264`, `h265`, `prores`. _(Default: `h264` if `-b` set, `prores` otherwise)_. |
 | `-G <gpu>` | GPU acceleration: `auto` (detect), `nvidia`, `amd`, `intel`, `off`. _(Default: auto)_. |
+| `-j <jobs>` | Parallel jobs for frame generation. `auto` _(default)_ = cores-1, `max` = all cores, `off` = sequential, or a number. |
+| `-T <dir>` | Temp directory for frames. Use disk path for large images (e.g., `-T ~/tmp`). Default: system temp (often RAM). |
 | `-a <bits>` | Alpha quality for ProRes video: `8` or `16`. _(Default: 16)_. |
 | `-y` | Force overwrite without prompting. |
 | `-v` | Verbose output. |
@@ -73,4 +75,13 @@ Example working settings:
 
 # H.265 for even smaller files
 ./imageScroller.sh -i mybanner.png -F video -b black -c h265
+
+# Fastest processing (all cores, may slow system)
+./imageScroller.sh -i mybanner.png -j max
+
+# Limit to 4 cores
+./imageScroller.sh -i mybanner.png -j 4
+
+# Sequential processing (slowest, minimal system impact)
+./imageScroller.sh -i mybanner.png -j off
 ```

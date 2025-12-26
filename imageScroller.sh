@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- Version ---
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Default Configuration ---
 DEFAULT_DIRECTION="left"       # Default if -d is not specified (content moves left)
@@ -17,6 +17,8 @@ FORCE_OVERWRITE=0              # Skip overwrite prompts if set to 1
 BACKGROUND_COLOR=""            # Background color (empty = transparent/ProRes, set = flatten/H.264)
 VIDEO_CODEC=""                 # Video codec (auto-detected based on background, or explicit)
 USE_GPU=""                     # GPU acceleration: auto, nvidia, amd, intel, off
+PARALLEL_JOBS=""               # Number of parallel jobs for frame generation (empty = auto)
+TEMP_DIR_BASE=""               # Base directory for temp files (empty = system default)
 
 # --- Usage Function ---
 usage() {
@@ -39,7 +41,14 @@ usage() {
   echo "                 and uses H.264 by default (much smaller files). Omit for transparency (ProRes)."
   echo "  -c <codec>   : Video codec: 'h264', 'h265', 'prores'. Default: 'h264' if -b set, 'prores' otherwise."
   echo "  -G <gpu>     : GPU acceleration: 'auto' (detect), 'nvidia', 'amd', 'intel', 'off'. Default: 'auto'."
+  echo "  -j <jobs>    : Parallel jobs for frame generation. Options:"
+  echo "                   Number (e.g., 4) = use exactly N cores"
+  echo "                   'auto' = use all cores minus 1 (default, keeps system responsive)"
+  echo "                   'max' = use all cores (fastest, may slow system)"
+  echo "                   'off' or 1 = sequential processing (slowest, minimal system impact)"
   echo "  -a <bits>    : Alpha quality for ProRes video: 8 or 16 (default: ${PRORES_ALPHA_BITS})."
+  echo "  -T <dir>     : Temp directory for frame files (default: system temp, often RAM-based)."
+  echo "                 Use a disk path for large images (e.g., -T /mnt/d/tmp or -T ~/tmp)."
   echo "  -y           : Force overwrite without prompting."
   echo "  -v           : Verbose output."
   echo "  -V           : Show version."
@@ -56,10 +65,12 @@ DELAY_INPUT=""
 SPEED_INPUT=""
 ALPHA_BITS_INPUT=""
 CODEC_INPUT=""
+JOBS_INPUT=""
+TEMP_DIR_INPUT=""
 OUTPUT_FORMAT="$DEFAULT_FORMAT"
 output_option_provided=0
 
-while getopts "i:o:F:d:g:t:s:b:c:G:a:yvVh" opt; do
+while getopts "i:o:F:d:g:t:s:b:c:G:j:T:a:yvVh" opt; do
   case $opt in
     i) INPUT_IMAGE="$OPTARG" ;;
     o)
@@ -74,6 +85,8 @@ while getopts "i:o:F:d:g:t:s:b:c:G:a:yvVh" opt; do
     b) BACKGROUND_COLOR="$OPTARG" ;;
     c) CODEC_INPUT="$OPTARG" ;;
     G) USE_GPU="$OPTARG" ;;
+    j) JOBS_INPUT="$OPTARG" ;;
+    T) TEMP_DIR_INPUT="$OPTARG" ;;
     a) ALPHA_BITS_INPUT="$OPTARG" ;;
     y) FORCE_OVERWRITE=1 ;;
     v) VERBOSE=1 ;;
@@ -108,6 +121,27 @@ fi
 if ! [[ "$GAP" =~ ^[0-9]+$ ]]; then
   echo "Error: Gap (-g) must be a non-negative integer." >&2; usage
 fi
+
+# Validate and set parallel jobs
+# Get number of CPU cores
+NUM_CPUS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+if [ -z "$JOBS_INPUT" ] || [ "$JOBS_INPUT" == "auto" ]; then
+    # Default: use all cores minus 1 to keep system responsive
+    PARALLEL_JOBS=$((NUM_CPUS > 1 ? NUM_CPUS - 1 : 1))
+elif [ "$JOBS_INPUT" == "max" ]; then
+    PARALLEL_JOBS=$NUM_CPUS
+elif [ "$JOBS_INPUT" == "off" ] || [ "$JOBS_INPUT" == "1" ]; then
+    PARALLEL_JOBS=1
+elif [[ "$JOBS_INPUT" =~ ^[0-9]+$ ]] && [ "$JOBS_INPUT" -gt 0 ]; then
+    PARALLEL_JOBS=$JOBS_INPUT
+    # Warn if requesting more cores than available
+    if [ "$PARALLEL_JOBS" -gt "$NUM_CPUS" ]; then
+        echo "Warning: Requested $PARALLEL_JOBS jobs but only $NUM_CPUS CPU cores available." >&2
+    fi
+else
+    echo "Error: Invalid jobs (-j) value '$JOBS_INPUT'. Use a number, 'auto', 'max', or 'off'." >&2; usage
+fi
+if [ "$VERBOSE" -eq 1 ]; then echo "Parallel jobs: $PARALLEL_JOBS (of $NUM_CPUS available cores)"; fi
 
 # Validate alpha bits if provided
 if [ -n "$ALPHA_BITS_INPUT" ]; then
@@ -356,7 +390,16 @@ STEP_W=$((W + GAP))
 STEP_H=$((H + GAP))
 
 # --- Create Temporary Directory ---
-TMP_DIR=$(mktemp -d)
+if [ -n "$TEMP_DIR_INPUT" ]; then
+    # User specified a temp directory base
+    if [ ! -d "$TEMP_DIR_INPUT" ]; then
+        echo "Error: Specified temp directory does not exist: $TEMP_DIR_INPUT" >&2
+        exit 1
+    fi
+    TMP_DIR=$(mktemp -d "$TEMP_DIR_INPUT/imageScroller.XXXXXX")
+else
+    TMP_DIR=$(mktemp -d)
+fi
 if [ "$VERBOSE" -eq 1 ]; then echo "Using temporary directory: $TMP_DIR"; fi
 
 # --- Cleanup Function ---
@@ -428,56 +471,218 @@ if [ "$MONTAGE_SUCCESS" -ne 1 ]; then echo "Error: Failed to create base tiled i
 if [ "$VERBOSE" -eq 1 ]; then echo "Base image created. Number of frames to generate: $NUM_FRAMES"; fi
 
 # --- Generate Frames ---
-echo "Generating $NUM_FRAMES animation frames..."
-FRAME_COUNT=0
-# Calculate progress interval: show ~20 updates for any frame count, minimum every frame for small counts
-PROGRESS_INTERVAL=$(( NUM_FRAMES / 20 ))
-[ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
+if [ "$PARALLEL_JOBS" -gt 1 ]; then
+    echo "Generating $NUM_FRAMES animation frames using $PARALLEL_JOBS parallel jobs..."
+else
+    echo "Generating $NUM_FRAMES animation frames..."
+fi
 
-for i in $(seq 0 $((NUM_FRAMES - 1))); do
-  OFFSET_X=0; OFFSET_Y=0
-  # This case statement uses the INTERNAL direction names
-  case "$DIRECTION" in
+# Helper function to calculate offset for a given frame
+calc_offset() {
+    local i=$1
+    local dir=$2
+    local step_w=$3
+    local step_h=$4
+    local ox=0 oy=0
+    case "$dir" in
+        horizontal) ox=$i ;;
+        horizontal-rev) ox=$(( step_w - 1 - i )) ;;
+        vertical) oy=$i ;;
+        vertical-rev) oy=$(( step_h - 1 - i )) ;;
+        diagonal-dr) ox=$(( i % step_w )); oy=$(( i % step_h )) ;;
+        diagonal-dl) ox=$(( (step_w - (i % step_w)) % step_w )); oy=$(( i % step_h )) ;;
+        diagonal-ur) ox=$(( i % step_w )); oy=$(( (step_h - (i % step_h)) % step_h )) ;;
+        diagonal-ul) ox=$(( (step_w - (i % step_w)) % step_w )); oy=$(( (step_h - (i % step_h)) % step_h )) ;;
+    esac
+    echo "$ox $oy"
+}
+
+# Generate frames (parallel or sequential based on PARALLEL_JOBS)
+if [ "$PARALLEL_JOBS" -gt 1 ]; then
+    # Create a helper script for parallel execution (avoids export -f issues)
+    WORKER_SCRIPT="$TMP_DIR/frame_worker.sh"
+    cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
+#!/bin/bash
+i=$1
+DIRECTION=$2
+STEP_W=$3
+STEP_H=$4
+W=$5
+H=$6
+BASE_IMAGE=$7
+TMP_DIR=$8
+IM_CONVERT=$9
+
+OFFSET_X=0; OFFSET_Y=0
+case "$DIRECTION" in
     horizontal) OFFSET_X=$i ;;
-    horizontal-rev) OFFSET_X=$(( STEP_W - 1 - i )) ;; # Window moves left
+    horizontal-rev) OFFSET_X=$(( STEP_W - 1 - i )) ;;
     vertical) OFFSET_Y=$i ;;
-    vertical-rev) OFFSET_Y=$(( STEP_H - 1 - i )) ;;   # Window moves up
+    vertical-rev) OFFSET_Y=$(( STEP_H - 1 - i )) ;;
     diagonal-dr) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
     diagonal-dl) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
     diagonal-ur) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
     diagonal-ul) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
-    *) echo "Error: Internal logic error - invalid direction '$DIRECTION'." >&2; exit 1 ;;
-  esac
-  # Using PNG for intermediate frames for better ffmpeg compatibility
-  if ! $IM_CONVERT "$BASE_IMAGE" -alpha set -crop "${W}x${H}+${OFFSET_X}+${OFFSET_Y}" +repage "$TMP_DIR/frame_$(printf "%05d" $i).png"; then
-    echo "Error: Failed to create frame $i." >&2; exit 1
-  fi
-  FRAME_COUNT=$((FRAME_COUNT + 1))
-  # Show progress: percentage-based updates
-  if [ "$VERBOSE" -eq 0 ] && (( (i + 1) % PROGRESS_INTERVAL == 0 || i == NUM_FRAMES - 1 )); then
-    PERCENT=$(( (i + 1) * 100 / NUM_FRAMES ))
-    printf "\rGenerating frames: %3d%% (%d/%d)" "$PERCENT" "$((i + 1))" "$NUM_FRAMES"
-  fi
-done
+esac
+
+ERR=$($IM_CONVERT "$BASE_IMAGE" -alpha set -crop "${W}x${H}+${OFFSET_X}+${OFFSET_Y}" +repage "$TMP_DIR/frame_$(printf "%05d" $i).png" 2>&1)
+if [ $? -eq 0 ]; then
+    echo "OK"
+else
+    echo "FAIL:$i:$ERR"
+fi
+WORKER_EOF
+    chmod +x "$WORKER_SCRIPT"
+
+    # Run parallel jobs with progress tracking
+    ERRORS_FILE="$TMP_DIR/errors.txt"
+    touch "$ERRORS_FILE"
+
+    # Generate all frame numbers and process in parallel
+    seq 0 $((NUM_FRAMES - 1)) | nice -n 10 xargs -P "$PARALLEL_JOBS" -I {} \
+        "$WORKER_SCRIPT" {} "$DIRECTION" "$STEP_W" "$STEP_H" "$W" "$H" "$BASE_IMAGE" "$TMP_DIR" "$IM_CONVERT" 2>&1 | \
+    {
+        FRAMES_DONE=0
+        PROGRESS_INTERVAL=$(( NUM_FRAMES / 40 ))
+        [ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
+        while read -r line; do
+            if [[ "$line" == "OK" ]]; then
+                FRAMES_DONE=$((FRAMES_DONE + 1))
+                if [ "$VERBOSE" -eq 0 ] && (( FRAMES_DONE % PROGRESS_INTERVAL == 0 )); then
+                    PERCENT=$(( FRAMES_DONE * 100 / NUM_FRAMES ))
+                    printf "\rGenerating frames: %3d%% (%d/%d)" "$PERCENT" "$FRAMES_DONE" "$NUM_FRAMES"
+                fi
+            elif [[ "$line" == FAIL:* ]]; then
+                echo "$line" >> "$ERRORS_FILE"
+            fi
+        done
+        # Final progress update
+        if [ "$VERBOSE" -eq 0 ]; then
+            printf "\rGenerating frames: 100%% (%d/%d)" "$NUM_FRAMES" "$NUM_FRAMES"
+        fi
+    }
+
+    # Check for errors
+    if [ -s "$ERRORS_FILE" ]; then
+        FAILED_COUNT=$(wc -l < "$ERRORS_FILE")
+        echo "" >&2
+        echo "Error: Failed to create $FAILED_COUNT frames." >&2
+        echo "First failure details:" >&2
+        head -1 "$ERRORS_FILE" | sed 's/FAIL:/  Frame /; s/:/ - /' >&2
+        echo "" >&2
+        echo "This may be an ImageMagick resource limit. Try:" >&2
+        echo "  - Reducing parallel jobs: -j 2" >&2
+        echo "  - Increasing ImageMagick limits in /etc/ImageMagick-6/policy.xml" >&2
+        exit 1
+    fi
+
+    # Verify frame count
+    FRAME_COUNT=$(find "$TMP_DIR" -name "frame_*.png" 2>/dev/null | wc -l)
+    if [ "$FRAME_COUNT" -ne "$NUM_FRAMES" ]; then
+        echo "" >&2
+        echo "Error: Only $FRAME_COUNT of $NUM_FRAMES frames were generated." >&2
+        exit 1
+    fi
+else
+    # Sequential execution (original behavior)
+    FRAME_COUNT=0
+    PROGRESS_INTERVAL=$(( NUM_FRAMES / 20 ))
+    [ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
+    for i in $(seq 0 $((NUM_FRAMES - 1))); do
+        OFFSET_X=0; OFFSET_Y=0
+        case "$DIRECTION" in
+            horizontal) OFFSET_X=$i ;;
+            horizontal-rev) OFFSET_X=$(( STEP_W - 1 - i )) ;;
+            vertical) OFFSET_Y=$i ;;
+            vertical-rev) OFFSET_Y=$(( STEP_H - 1 - i )) ;;
+            diagonal-dr) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
+            diagonal-dl) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( i % STEP_H )) ;;
+            diagonal-ur) OFFSET_X=$(( i % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
+            diagonal-ul) OFFSET_X=$(( (STEP_W - (i % STEP_W)) % STEP_W )); OFFSET_Y=$(( (STEP_H - (i % STEP_H)) % STEP_H )) ;;
+            *) echo "Error: Internal logic error - invalid direction '$DIRECTION'." >&2; exit 1 ;;
+        esac
+        if ! $IM_CONVERT "$BASE_IMAGE" -alpha set -crop "${W}x${H}+${OFFSET_X}+${OFFSET_Y}" +repage "$TMP_DIR/frame_$(printf "%05d" $i).png"; then
+            echo "Error: Failed to create frame $i." >&2; exit 1
+        fi
+        FRAME_COUNT=$((FRAME_COUNT + 1))
+        if [ "$VERBOSE" -eq 0 ] && (( (i + 1) % PROGRESS_INTERVAL == 0 || i == NUM_FRAMES - 1 )); then
+            PERCENT=$(( (i + 1) * 100 / NUM_FRAMES ))
+            printf "\rGenerating frames: %3d%% (%d/%d)" "$PERCENT" "$((i + 1))" "$NUM_FRAMES"
+        fi
+    done
+fi
 if [ "$VERBOSE" -eq 0 ]; then printf "\n"; fi
 if [ "$VERBOSE" -eq 1 ]; then echo "Generated $FRAME_COUNT frames."; fi
 
 # --- Flatten Frames to Background Color (if specified) ---
 if [ -n "$BACKGROUND_COLOR" ]; then
-    echo "Flattening frames to background color: $BACKGROUND_COLOR"
-    FLATTEN_COUNT=0
-    for frame in "$TMP_DIR"/frame_*.png; do
-        if ! $IM_CONVERT "$frame" -background "$BACKGROUND_COLOR" -flatten "$frame"; then
-            echo "Error: Failed to flatten frame to background color." >&2; exit 1
+    if [ "$PARALLEL_JOBS" -gt 1 ]; then
+        echo "Flattening frames to background color: $BACKGROUND_COLOR (using $PARALLEL_JOBS parallel jobs)..."
+
+        # Create flatten worker script
+        FLATTEN_SCRIPT="$TMP_DIR/flatten_worker.sh"
+        cat > "$FLATTEN_SCRIPT" << 'FLATTEN_EOF'
+#!/bin/bash
+frame=$1
+bg_color=$2
+im_convert=$3
+if $im_convert "$frame" -background "$bg_color" -flatten "$frame" 2>/dev/null; then
+    echo "OK"
+else
+    echo "FAIL:$frame"
+fi
+FLATTEN_EOF
+        chmod +x "$FLATTEN_SCRIPT"
+
+        FLATTEN_ERRORS="$TMP_DIR/flatten_errors.txt"
+        touch "$FLATTEN_ERRORS"
+
+        find "$TMP_DIR" -name "frame_*.png" | nice -n 10 xargs -P "$PARALLEL_JOBS" -I {} \
+            "$FLATTEN_SCRIPT" {} "$BACKGROUND_COLOR" "$IM_CONVERT" 2>&1 | \
+        {
+            FLATTEN_COUNT=0
+            PROGRESS_INTERVAL=$(( FRAME_COUNT / 40 ))
+            [ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
+            while read -r line; do
+                if [[ "$line" == "OK" ]]; then
+                    FLATTEN_COUNT=$((FLATTEN_COUNT + 1))
+                    if [ "$VERBOSE" -eq 0 ] && (( FLATTEN_COUNT % PROGRESS_INTERVAL == 0 )); then
+                        PERCENT=$(( FLATTEN_COUNT * 100 / FRAME_COUNT ))
+                        printf "\rFlattening frames: %3d%% (%d/%d)" "$PERCENT" "$FLATTEN_COUNT" "$FRAME_COUNT"
+                    fi
+                elif [[ "$line" == FAIL:* ]]; then
+                    echo "${line#FAIL:}" >> "$FLATTEN_ERRORS"
+                fi
+            done
+            if [ "$VERBOSE" -eq 0 ]; then
+                printf "\rFlattening frames: 100%% (%d/%d)" "$FRAME_COUNT" "$FRAME_COUNT"
+            fi
+        }
+
+        if [ -s "$FLATTEN_ERRORS" ]; then
+            FAILED_COUNT=$(wc -l < "$FLATTEN_ERRORS")
+            echo "" >&2
+            echo "Error: Failed to flatten $FAILED_COUNT frames." >&2
+            exit 1
         fi
-        FLATTEN_COUNT=$((FLATTEN_COUNT + 1))
-        if [ "$VERBOSE" -eq 0 ] && (( FLATTEN_COUNT % PROGRESS_INTERVAL == 0 || FLATTEN_COUNT == FRAME_COUNT )); then
-            PERCENT=$(( FLATTEN_COUNT * 100 / FRAME_COUNT ))
-            printf "\rFlattening frames: %3d%% (%d/%d)" "$PERCENT" "$FLATTEN_COUNT" "$FRAME_COUNT"
-        fi
-    done
+    else
+        echo "Flattening frames to background color: $BACKGROUND_COLOR"
+        FLATTEN_COUNT=0
+        PROGRESS_INTERVAL=$(( FRAME_COUNT / 20 ))
+        [ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=1
+        for frame in "$TMP_DIR"/frame_*.png; do
+            if ! $IM_CONVERT "$frame" -background "$BACKGROUND_COLOR" -flatten "$frame"; then
+                echo "Error: Failed to flatten frame to background color." >&2; exit 1
+            fi
+            FLATTEN_COUNT=$((FLATTEN_COUNT + 1))
+            if [ "$VERBOSE" -eq 0 ] && (( FLATTEN_COUNT % PROGRESS_INTERVAL == 0 || FLATTEN_COUNT == FRAME_COUNT )); then
+                PERCENT=$(( FLATTEN_COUNT * 100 / FRAME_COUNT ))
+                printf "\rFlattening frames: %3d%% (%d/%d)" "$PERCENT" "$FLATTEN_COUNT" "$FRAME_COUNT"
+            fi
+        done
+    fi
     if [ "$VERBOSE" -eq 0 ]; then printf "\n"; fi
-    if [ "$VERBOSE" -eq 1 ]; then echo "Flattened $FLATTEN_COUNT frames to $BACKGROUND_COLOR."; fi
+    if [ "$VERBOSE" -eq 1 ]; then echo "Flattened $FRAME_COUNT frames to $BACKGROUND_COLOR."; fi
 fi
 
 # --- Assemble Output File(s) ---
